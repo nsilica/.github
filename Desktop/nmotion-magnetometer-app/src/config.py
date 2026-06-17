@@ -36,12 +36,20 @@ class AppConfig:
         rec_dir.mkdir(parents=True, exist_ok=True)
         self._recording_directory_resolved = rec_dir
 
+        # Asegurar que el directorio de metadatos existe
+        meta_dir = Path(self._data.get("metadata", {}).get("directory", "./metadata"))
+        if not meta_dir.is_absolute():
+            meta_dir = config_path.parent / meta_dir
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        self._metadata_directory_resolved = meta_dir
+
     @staticmethod
     def _defaults() -> dict[str, Any]:
         return {
             "app": {"title": "nMotion Magnetometer", "window_width": 1280, "window_height": 800},
             "serial": {"port": None, "baudrate": 115200, "auto_connect": True},
             "recording": {"directory": "./recordings", "format": "json", "max_samples": 100000},
+            "metadata": {"directory": "./metadata"},
             "ui": {
                 "background_color": "#F6FBFF",
                 "accent_color": "#1D85ED",
@@ -88,6 +96,10 @@ class AppConfig:
     @property
     def recording_max_samples(self) -> int:
         return int(self._data["recording"].get("max_samples", 100000))
+
+    @property
+    def metadata_directory(self) -> Path:
+        return self._metadata_directory_resolved
 
     @property
     def ui_colors(self) -> dict[str, str]:

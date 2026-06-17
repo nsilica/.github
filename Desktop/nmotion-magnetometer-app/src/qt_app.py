@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 import threading
@@ -11,7 +10,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -29,11 +30,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.calibration_store import CalibrationStore
 from src.config import AppConfig
 from src.dongle_protocol import IMUData
-from src.qt_plots import MagneticCanvas, OrientationCanvas
+from src.qt_plots import MagneticCanvas, NorthCanvas, OrientationCanvas, _quat_to_matrix
 from src.recorder import Recording, RecordingManager
 from src.serial_worker import SerialWorker
+
+# Offset fijo de montaje para el modo Norte (se resta al heading yaw).
+MOUNTING_OFFSET_DEG = 90.0
 
 
 def _format_ms(ms: float) -> str:
@@ -55,6 +60,8 @@ def _mode_name(mode: str) -> str:
         return "Orientación"
     if mode == "magnetic":
         return "Calibración Hard Iron"
+    if mode == "north":
+        return "Norte Magnético"
     return mode
 
 
@@ -71,28 +78,53 @@ class HomePage(QWidget):
         super().__init__()
         self._on_measure = on_measure
         self._on_replay = on_replay
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(28)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(96, 48, 96, 48)
+        root.setSpacing(64)
+
+        left = QVBoxLayout()
+        left.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        left.setSpacing(20)
+        left.addStretch(1)
 
         logo = QLabel("nMotion")
         logo.setObjectName("homeTitle")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setAlignment(Qt.AlignmentFlag.AlignLeft)
         subtitle = QLabel("Magnetometer & Orientation Lab")
         subtitle.setObjectName("muted")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
         actions = QHBoxLayout()
+        actions.setSpacing(16)
+        actions.setAlignment(Qt.AlignmentFlag.AlignLeft)
         measure_btn = _button("Iniciar medición", primary=True)
         replay_btn = _button("Reproducir medición", primary=True)
+        measure_btn.setMinimumWidth(220)
+        replay_btn.setMinimumWidth(220)
         measure_btn.clicked.connect(self._on_measure)
         replay_btn.clicked.connect(self._on_replay)
         actions.addWidget(measure_btn)
         actions.addWidget(replay_btn)
+        actions.addStretch(1)
 
-        layout.addWidget(logo)
-        layout.addWidget(subtitle)
-        layout.addLayout(actions)
+        left.addWidget(logo)
+        left.addWidget(subtitle)
+        left.addSpacing(12)
+        left.addLayout(actions)
+        left.addStretch(1)
+
+        right = QVBoxLayout()
+        right.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image_label = QLabel()
+        pixmap = QPixmap(str(Path(__file__).resolve().parent.parent / "assets" / "app_logo.png"))
+        if not pixmap.isNull():
+            scaled = pixmap.scaledToHeight(260, Qt.TransformationMode.SmoothTransformation)
+            image_label.setPixmap(scaled)
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(image_label)
+
+        root.addLayout(left, 3)
+        root.addLayout(right, 2)
 
 
 class MeasurePage(QWidget):
@@ -101,17 +133,19 @@ class MeasurePage(QWidget):
         self._on_back = on_back
         self._worker = SerialWorker(on_data=self._on_imu_data)
         self._recorder = RecordingManager()
+        self._calibration_store = CalibrationStore()
         self._latest_lock = threading.Lock()
         self._recording_lock = threading.Lock()
         self._latest_imu: IMUData | None = None
         self._latest_orientation_q: tuple[float, float, float, float] | None = None
         self._orientation_reference_q: tuple[float, float, float, float] | None = None
         self._mode: str | None = None
-        self._canvas: OrientationCanvas | MagneticCanvas | None = None
+        self._canvas: OrientationCanvas | MagneticCanvas | NorthCanvas | None = None
         self._recording_samples: list[dict[str, Any]] = []
         self._recording_start: float | None = None
         self._recording_base_t_ms: int | None = None
         self._magnetic_frozen = False
+        self._magnetic_calibration: dict[str, Any] | None = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -138,8 +172,10 @@ class MeasurePage(QWidget):
 
         self._orientation_btn = _button("Medir orientación", primary=True)
         self._magnetic_btn = _button("Calibración Hard Iron", primary=True)
+        self._north_btn = _button("Norte Magnético", primary=True)
         self._orientation_btn.clicked.connect(lambda: self.open_mode("orientation"))
         self._magnetic_btn.clicked.connect(lambda: self.open_mode("magnetic"))
+        self._north_btn.clicked.connect(lambda: self.open_mode("north"))
 
         self._action_btn = _button("Calibrar orientación")
         self._action_btn.clicked.connect(self._run_action)
@@ -185,11 +221,14 @@ class MeasurePage(QWidget):
         self._plot_body_layout = QHBoxLayout(self._plot_body)
         self._plot_body_layout.setContentsMargins(0, 0, 0, 0)
         self._plot_body_layout.setSpacing(12)
+        # Canvas occupies index 0; KPI panel is fixed on the right.
+        self._plot_body_layout.addWidget(self._kpi_widget)
 
         panel_layout.addLayout(title_row)
         panel_layout.addWidget(QLabel("Visualiza datos IMU en tiempo real."))
         panel_layout.addWidget(self._orientation_btn)
         panel_layout.addWidget(self._magnetic_btn)
+        panel_layout.addWidget(self._north_btn)
         panel_layout.addStretch(1)
         panel_layout.addWidget(self._status)
 
@@ -197,10 +236,13 @@ class MeasurePage(QWidget):
         self._plot_host.setObjectName("plotHost")
         self._plot_layout = QVBoxLayout(self._plot_host)
         self._plot_layout.setContentsMargins(12, 12, 12, 12)
-        placeholder = QLabel("Selecciona un modo para abrir matplotlib embebido")
-        placeholder.setObjectName("muted")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._plot_layout.addWidget(placeholder)
+        self._plot_placeholder = QLabel("Selecciona un modo para abrir matplotlib embebido")
+        self._plot_placeholder.setObjectName("muted")
+        self._plot_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._plot_layout.addWidget(self._plot_placeholder, 1)
+        self._plot_layout.addWidget(self._plot_timer_widget)
+        self._plot_layout.addWidget(self._plot_body, 1)
+        self._plot_layout.addWidget(self._plot_controls_widget)
 
         root.addWidget(panel)
         root.addWidget(self._plot_host, 1)
@@ -215,18 +257,75 @@ class MeasurePage(QWidget):
         self._latest_orientation_q = None
         if mode == "magnetic":
             self._magnetic_frozen = False
-        self._replace_canvas(OrientationCanvas() if mode == "orientation" else MagneticCanvas())
-        self._action_btn.setText("Calibrar orientación" if mode == "orientation" else "Resetear mediciones")
+        if mode == "orientation":
+            canvas: OrientationCanvas | MagneticCanvas | NorthCanvas = OrientationCanvas()
+        elif mode == "north":
+            canvas = NorthCanvas()
+        else:
+            canvas = MagneticCanvas()
+        self._replace_canvas(canvas)
+        if mode == "orientation":
+            self._orientation_reference_q = self._calibration_store.load_orientation_reference()
+            if self._orientation_reference_q:
+                self._set_button_danger(self._action_btn, "Resetear orientación", True)
+            else:
+                self._action_btn.setText("Calibrar orientación")
+                self._action_btn.setProperty("class", "ghost")
+                self._action_btn.style().unpolish(self._action_btn)
+                self._action_btn.style().polish(self._action_btn)
+        elif mode == "north":
+            self._load_magnetic_calibration()
+            action_text = (
+                "Calibración cargada" if self._magnetic_calibration is not None else "Cargar calibración"
+            )
+            self._set_button_success(
+                self._action_btn, action_text, self._magnetic_calibration is not None
+            )
+        else:
+            self._set_button_danger(self._action_btn, "Resetear mediciones", True)
+        if mode != "north" and mode != "orientation":
+            self._action_btn.setText("Resetear mediciones")
         self._mag_calibration_btn.setVisible(mode == "magnetic")
         self._timer_label.setText("00:00")
         self._update_kpis(None)
         self._set_controls_enabled(True)
         self._update_mode_buttons()
         self._status.setText("Conectando al dongle nMotion...")
+
+        if mode == "magnetic":
+            self._load_magnetic_calibration()
+            if self._magnetic_calibration is not None and isinstance(
+                self._canvas, MagneticCanvas
+            ):
+                self._canvas.load_calibration_state(
+                    self._magnetic_calibration.get("center_lsb", [0.0, 0.0, 0.0]),
+                    self._magnetic_calibration.get("radius_lsb", 0.0),
+                    points_lsb=self._magnetic_calibration.get("points_lsb"),
+                    stable=self._magnetic_calibration.get("stable", False),
+                )
+                self._magnetic_frozen = True
+                self._update_kpis(self._magnetic_calibration)
+                self._set_button_success(
+                    self._mag_calibration_btn, "Calibración guardada", True
+                )
+                self._status.setText(
+                    "Calibración magnética cargada. Medición congelada."
+                )
+            else:
+                self._set_button_success(
+                    self._mag_calibration_btn, "Guardar calibración magnética", False
+                )
         started = self._worker.start()
         if started:
             self._timer.start()
-            self._status.setText("Conectado. Recibiendo datos en vivo.")
+            if mode == "orientation" and self._orientation_reference_q:
+                self._status.setText("Orientación calibrada cargada.")
+            elif mode == "magnetic" and self._magnetic_frozen:
+                self._status.setText(
+                    "Calibración magnética cargada. Medición congelada."
+                )
+            else:
+                self._status.setText("Conectado. Recibiendo datos en vivo.")
         else:
             self._status.setText(self._worker.last_error or "No se pudo iniciar la lectura serie.")
 
@@ -249,30 +348,24 @@ class MeasurePage(QWidget):
         self._timer.stop()
         self._worker.stop()
 
-    def _replace_canvas(self, canvas: OrientationCanvas | MagneticCanvas | None) -> None:
-        while self._plot_body_layout.count():
-            item = self._plot_body_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-
-        while self._plot_layout.count():
-            item = self._plot_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
+    def _replace_canvas(self, canvas: OrientationCanvas | MagneticCanvas | NorthCanvas | None) -> None:
+        # Remove and destroy the previous canvas (matplotlib canvas is single-use here).
+        if self._canvas is not None:
+            self._plot_body_layout.removeWidget(self._canvas)
+            self._canvas.setParent(None)
+            self._canvas.deleteLater()
         self._canvas = canvas
         if canvas is None:
-            placeholder = QLabel("Selecciona un modo para abrir matplotlib embebido")
-            placeholder.setObjectName("muted")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._plot_layout.addWidget(placeholder)
+            self._plot_placeholder.setVisible(True)
+            self._plot_timer_widget.setVisible(False)
+            self._plot_body.setVisible(False)
+            self._plot_controls_widget.setVisible(False)
         else:
-            self._plot_layout.addWidget(self._plot_timer_widget)
-            self._plot_body_layout.addWidget(canvas, 1)
-            self._plot_body_layout.addWidget(self._kpi_widget)
-            self._plot_layout.addWidget(self._plot_body, 1)
-            self._plot_layout.addWidget(self._plot_controls_widget)
+            self._plot_body_layout.insertWidget(0, canvas, 1)
+            self._plot_placeholder.setVisible(False)
+            self._plot_timer_widget.setVisible(True)
+            self._plot_body.setVisible(True)
+            self._plot_controls_widget.setVisible(True)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self._action_btn.setEnabled(enabled)
@@ -289,9 +382,24 @@ class MeasurePage(QWidget):
         self._magnetic_btn.setProperty(
             "class", "primarySelected" if self._mode == "magnetic" else "primary"
         )
-        for btn in (self._orientation_btn, self._magnetic_btn):
+        self._north_btn.setProperty(
+            "class", "primarySelected" if self._mode == "north" else "primary"
+        )
+        for btn in (self._orientation_btn, self._magnetic_btn, self._north_btn):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def _set_button_success(self, btn: QPushButton, text: str, success: bool) -> None:
+        btn.setText(text)
+        btn.setProperty("class", "success" if success else "ghost")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+    def _set_button_danger(self, btn: QPushButton, text: str, danger: bool) -> None:
+        btn.setText(text)
+        btn.setProperty("class", "danger" if danger else "ghost")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
 
     def _on_imu_data(self, imu: IMUData) -> None:
         with self._latest_lock:
@@ -334,6 +442,29 @@ class MeasurePage(QWidget):
             calibration = self._canvas.calibration()
             self._update_kpis(calibration)
             self._record_visual_sample(imu, {"magnetic_calibration": calibration})
+        elif self._mode == "north" and isinstance(self._canvas, NorthCanvas):
+            q = imu.quat_q15
+            center_lsb = (
+                self._magnetic_calibration.get("center_lsb")
+                if self._magnetic_calibration is not None
+                else None
+            )
+            drawing_angle, calibrated = MeasurePage._compute_north_drawing_angle_rad(
+                imu.mx, imu.my, imu.mz, q, center_lsb=center_lsb
+            )
+            self._canvas.update_heading(drawing_angle, now_s=time.monotonic())
+            self._update_kpis((drawing_angle, calibrated))
+            roll, pitch, yaw = self._quat_to_euler_deg(q)
+            visual: dict[str, Any] = {
+                "display_q": list(q),
+                "north_drawing_deg": math.degrees(drawing_angle),
+                "roll_deg": roll,
+                "pitch_deg": pitch,
+                "yaw_deg": yaw,
+            }
+            if center_lsb is not None:
+                visual["magnetic_center_lsb"] = center_lsb
+            self._record_visual_sample(imu, visual)
 
         with self._recording_lock:
             if self._recording_start is not None:
@@ -342,14 +473,47 @@ class MeasurePage(QWidget):
 
     def _run_action(self) -> None:
         if self._mode == "orientation":
-            if self._latest_orientation_q is not None:
+            if self._orientation_reference_q is not None:
+                # Reset orientation calibration
+                self._orientation_reference_q = None
+                self._calibration_store.delete_orientation_reference()
+                self._action_btn.setText("Calibrar orientación")
+                self._action_btn.setProperty("class", "ghost")
+                self._action_btn.style().unpolish(self._action_btn)
+                self._action_btn.style().polish(self._action_btn)
+                self._update_kpis(None)
+                self._status.setText("Orientación reseteada.")
+            elif self._latest_orientation_q is not None:
                 self._orientation_reference_q = self._latest_orientation_q
+                self._calibration_store.save_orientation_reference(self._latest_orientation_q)
+                self._set_button_danger(self._action_btn, "Resetear orientación", True)
+                self._update_kpis(self._latest_orientation_q)
                 self._status.setText("Orientación calibrada contra la pose actual.")
+        elif self._mode == "north":
+            self._load_magnetic_calibration()
+            loaded = self._magnetic_calibration is not None
+            self._set_button_success(
+                self._action_btn,
+                "Calibración cargada" if loaded else "Cargar calibración",
+                loaded,
+            )
         elif isinstance(self._canvas, MagneticCanvas):
             self._magnetic_frozen = False
+            self._magnetic_calibration = None
+            self._calibration_store.delete_magnetic_calibration()
+            self._set_button_success(
+                self._mag_calibration_btn, "Guardar calibración magnética", False
+            )
             self._canvas.clear()
             self._update_kpis(None)
             self._status.setText("Mediciones magnéticas reseteadas.")
+
+    def _load_magnetic_calibration(self) -> None:
+        self._magnetic_calibration = self._calibration_store.load_magnetic_calibration()
+        if self._magnetic_calibration is None:
+            self._status.setText("No hay calibración magnética guardada.")
+        else:
+            self._status.setText("Calibración magnética cargada.")
 
     def _save_magnetic_calibration(self) -> None:
         if not isinstance(self._canvas, MagneticCanvas):
@@ -358,16 +522,21 @@ class MeasurePage(QWidget):
         if calibration is None:
             self._status.setText("No hay ajuste de esfera suficiente para guardar calibración.")
             return
-        payload = {
-            "version": 1,
-            "type": "magnetic_hard_iron",
-            "created_at": datetime.now(UTC).isoformat(),
-            "calibration": calibration,
-        }
-        path = self._recorder.directory / "magnetic_hard_iron_calibration.json"
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        points = list(
+            zip(
+                list(self._canvas._points["x"]),
+                list(self._canvas._points["y"]),
+                list(self._canvas._points["z"]),
+                strict=True,
+            )
+        )
+        max_points = 1000
+        if len(points) > max_points:
+            indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
+            points = [points[i] for i in indices]
+        path = self._calibration_store.save_magnetic_calibration(calibration, points)
         self._magnetic_frozen = True
+        self._set_button_success(self._mag_calibration_btn, "Calibración guardada", True)
         self._status.setText(f"Calibración magnética guardada: {path.name}")
 
     def _record_visual_sample(self, imu: IMUData, visual: dict[str, Any]) -> None:
@@ -430,6 +599,13 @@ class MeasurePage(QWidget):
                     (f"R {radius:.1f}", "neutral"),
                     (stability_text, "stable" if stable else "unstable"),
                 )
+        elif self._mode == "north":
+            if not isinstance(data, tuple) or len(data) != 2:
+                values = (("Norte -", "neutral"),)
+            else:
+                drawing_angle, calibrated = data
+                yaw_deg = math.degrees(drawing_angle)
+                values = ((f"Norte {yaw_deg:+.1f}°", "stable" if calibrated else "unstable"),)
         else:
             values = (("-", "neutral"),)
         for idx, label in enumerate(self._kpi_labels):
@@ -457,6 +633,38 @@ class MeasurePage(QWidget):
         cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         return (math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
+
+    @staticmethod
+    def _compute_north_drawing_angle_rad(
+        mx: float,
+        my: float,
+        mz: float,
+        q: tuple[float, float, float, float],
+        center_lsb: list[float] | None = None,
+    ) -> tuple[float, bool]:
+        """Return (drawing_angle_rad, calibrated) for the north compass.
+
+        The magnetometer reading is rotated into the global/earth frame using
+        the quaternion, so the resulting heading is independent of the sensor
+        yaw. The drawing angle is that earth-frame heading plus the fixed
+        mounting offset. Negative = clockwise from the triangle, positive =
+        counter-clockwise.
+        """
+        calibrated = center_lsb is not None
+        if calibrated:
+            mx -= float(center_lsb[0])
+            my -= float(center_lsb[1])
+            mz -= float(center_lsb[2])
+
+        m_corr = np.array([mx, my, mz], dtype=float)
+        r = _quat_to_matrix(*q)
+        m_earth = r @ m_corr
+        heading_mag = math.atan2(m_earth[1], m_earth[0])
+
+        drawing_angle = -(heading_mag + math.radians(MOUNTING_OFFSET_DEG))
+        # Normalize to [-pi, pi]
+        drawing_angle = (drawing_angle + math.pi) % (2 * math.pi) - math.pi
+        return drawing_angle, calibrated
 
     def _toggle_recording(self) -> None:
         with self._recording_lock:
@@ -524,7 +732,7 @@ class ReplayPage(QWidget):
         self._on_back = on_back
         self._recorder = RecordingManager()
         self._recording: Recording | None = None
-        self._canvas: OrientationCanvas | MagneticCanvas | None = None
+        self._canvas: OrientationCanvas | MagneticCanvas | NorthCanvas | None = None
         self._seeking = False
         self._was_playing_before_seek = False
         self._playing = False
@@ -591,6 +799,14 @@ class ReplayPage(QWidget):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             replay_kpi_layout.addWidget(label)
         replay_kpi_layout.addStretch(1)
+        # Canvas is inserted at index 0; KPI panel is fixed on the right.
+        self._replay_body_layout.addWidget(self._replay_kpi_widget)
+
+        self._replay_placeholder = QLabel("Selecciona un modo para abrir matplotlib embebido")
+        self._replay_placeholder.setObjectName("muted")
+        self._replay_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._plot_layout.addWidget(self._replay_placeholder, 1)
+        self._plot_layout.addWidget(self._replay_body, 1)
         self._replace_canvas(None)
 
         controls_frame = QFrame()
@@ -648,27 +864,19 @@ class ReplayPage(QWidget):
         self._play_btn.setEnabled(enabled)
         self._slider.setEnabled(enabled)
 
-    def _replace_canvas(self, canvas: OrientationCanvas | MagneticCanvas | None) -> None:
-        while self._replay_body_layout.count():
-            item = self._replay_body_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-        while self._plot_layout.count():
-            item = self._plot_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
+    def _replace_canvas(self, canvas: OrientationCanvas | MagneticCanvas | NorthCanvas | None) -> None:
+        if self._canvas is not None:
+            self._replay_body_layout.removeWidget(self._canvas)
+            self._canvas.setParent(None)
+            self._canvas.deleteLater()
         self._canvas = canvas
         if canvas is None:
-            placeholder = QLabel("Selecciona una grabación para reproducir")
-            placeholder.setObjectName("muted")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._plot_layout.addWidget(placeholder)
+            self._replay_placeholder.setVisible(True)
+            self._replay_body.setVisible(False)
         else:
-            self._replay_body_layout.addWidget(canvas, 1)
-            self._replay_body_layout.addWidget(self._replay_kpi_widget)
-            self._plot_layout.addWidget(self._replay_body, 1)
+            self._replay_body_layout.insertWidget(0, canvas, 1)
+            self._replay_placeholder.setVisible(False)
+            self._replay_body.setVisible(True)
 
     def _load_selected(self) -> None:
         item = self._list.currentItem()
@@ -686,8 +894,14 @@ class ReplayPage(QWidget):
         self._last_pos = 0.0
         self._last_sample_t = -1
         self._position_ms = 0.0
-        canvas = OrientationCanvas() if self._recording.header.mode == "orientation" else MagneticCanvas()
+        if self._recording.header.mode == "orientation":
+            canvas: OrientationCanvas | MagneticCanvas | NorthCanvas = OrientationCanvas()
+        elif self._recording.header.mode == "north":
+            canvas = NorthCanvas()
+        else:
+            canvas = MagneticCanvas()
         self._replace_canvas(canvas)
+        self._apply_recorded_calibration_to_canvas()
         self._slider.setMaximum(max(int(self._recording.header.duration_ms), 1))
         self._slider.setValue(0)
         self._time_label.setText(f"00:00 / {_format_ms(self._recording.header.duration_ms)}")
@@ -744,9 +958,12 @@ class ReplayPage(QWidget):
             return
         pos = self._current_replay_position()
         duration = self._duration_ms()
-        if pos < self._last_pos and isinstance(self._canvas, MagneticCanvas):
-            self._canvas.clear()
-            self._last_sample_t = -1
+        if pos < self._last_pos:
+            if isinstance(self._canvas, MagneticCanvas):
+                self._canvas.clear()
+                self._last_sample_t = -1
+            elif isinstance(self._canvas, NorthCanvas):
+                self._canvas.reset_variation()
         self._last_pos = pos
         self._slider.setValue(int(pos))
         self._time_label.setText(f"{_format_ms(pos)} / {_format_ms(duration)}")
@@ -758,6 +975,16 @@ class ReplayPage(QWidget):
         if self._recording.header.mode == "orientation" and isinstance(self._canvas, OrientationCanvas):
             q = self._sample_quaternion(sample)
             self._canvas.update_quaternion(q[0], q[1], q[2], q[3])
+        elif self._recording.header.mode == "north" and isinstance(self._canvas, NorthCanvas):
+            q = self._sample_quaternion(sample)
+            mag = sample.get("raw", {}).get("mag", [0, 0, 0])
+            cal = sample.get("visual", {}).get("magnetic_calibration")
+            center_lsb = cal.get("center_lsb") if isinstance(cal, dict) else None
+            drawing_angle, _calibrated = MeasurePage._compute_north_drawing_angle_rad(
+                float(mag[0]), float(mag[1]), float(mag[2]), tuple(q), center_lsb=center_lsb
+            )
+            now_s = float(sample.get("t_ms", 0)) / 1000.0
+            self._canvas.update_heading(drawing_angle, now_s=now_s)
         elif isinstance(self._canvas, MagneticCanvas):
             t_ms = int(sample.get("t_ms", 0))
             if t_ms < self._last_sample_t:
@@ -765,7 +992,15 @@ class ReplayPage(QWidget):
             self._last_sample_t = t_ms
             mag = sample.get("raw", {}).get("mag", [0, 0, 0])
             self._canvas.add_point(mag[0], mag[1], mag[2])
-            self._canvas.update_view()
+            cal = sample.get("visual", {}).get("magnetic_calibration")
+            if isinstance(cal, dict):
+                self._canvas.set_calibration(
+                    cal.get("center_lsb", [0.0, 0.0, 0.0]),
+                    cal.get("radius_lsb", 0.0),
+                    stable=cal.get("stable", False),
+                    draw=False,
+                )
+            self._canvas.render_state()
 
     def _render_position(self, position_ms: float, *, force_rebuild: bool) -> None:
         if self._recording is None or self._canvas is None:
@@ -776,10 +1011,30 @@ class ReplayPage(QWidget):
                 self._canvas.update_quaternion(q[0], q[1], q[2], q[3])
                 self._update_replay_kpis("orientation", q)
             return
+        if self._recording.header.mode == "north":
+            if force_rebuild:
+                self._rebuild_north_until(position_ms)
+                return
+            sample = self._sample_at(position_ms)
+            if sample is None:
+                return
+            q = self._sample_quaternion(sample)
+            mag = sample.get("raw", {}).get("mag", [0, 0, 0])
+            cal = sample.get("visual", {}).get("magnetic_calibration")
+            center_lsb = cal.get("center_lsb") if isinstance(cal, dict) else None
+            drawing_angle, _calibrated = MeasurePage._compute_north_drawing_angle_rad(
+                float(mag[0]), float(mag[1]), float(mag[2]), tuple(q), center_lsb=center_lsb
+            )
+            now_s = float(sample.get("t_ms", 0)) / 1000.0
+            if isinstance(self._canvas, NorthCanvas):
+                self._canvas.update_heading(drawing_angle, now_s=now_s)
+            self._update_replay_kpis("north", drawing_angle)
+            return
         if isinstance(self._canvas, MagneticCanvas):
             if force_rebuild:
                 self._rebuild_magnetic_until(position_ms)
                 return
+            last_cal: dict[str, Any] | None = None
             for sample in self._recording.samples:
                 t_ms = int(sample.get("t_ms", 0))
                 if t_ms <= self._last_sample_t:
@@ -789,7 +1044,17 @@ class ReplayPage(QWidget):
                 mag = sample.get("raw", {}).get("mag", [0, 0, 0])
                 self._canvas.add_point(mag[0], mag[1], mag[2])
                 self._last_sample_t = t_ms
-            self._canvas.update_view()
+                cal = sample.get("visual", {}).get("magnetic_calibration")
+                if isinstance(cal, dict):
+                    last_cal = cal
+            if last_cal is not None:
+                self._canvas.set_calibration(
+                    last_cal.get("center_lsb", [0.0, 0.0, 0.0]),
+                    last_cal.get("radius_lsb", 0.0),
+                    stable=last_cal.get("stable", False),
+                    draw=False,
+                )
+            self._canvas.render_state()
             self._update_replay_kpis("magnetic", self._canvas.calibration())
 
     def _rebuild_magnetic_until(self, position_ms: float) -> None:
@@ -797,14 +1062,46 @@ class ReplayPage(QWidget):
             return
         self._canvas.clear()
         self._last_sample_t = -1
+        last_cal: dict[str, Any] | None = None
         for sample in self._recording.samples:
             if float(sample.get("t_ms", 0)) > position_ms:
                 break
             mag = sample.get("raw", {}).get("mag", [0, 0, 0])
             self._canvas.add_point(mag[0], mag[1], mag[2])
             self._last_sample_t = int(sample.get("t_ms", 0))
-        self._canvas.update_view()
+            cal = sample.get("visual", {}).get("magnetic_calibration")
+            if isinstance(cal, dict):
+                last_cal = cal
+        if last_cal is not None:
+            self._canvas.set_calibration(
+                last_cal.get("center_lsb", [0.0, 0.0, 0.0]),
+                last_cal.get("radius_lsb", 0.0),
+                stable=last_cal.get("stable", False),
+                draw=False,
+            )
+        self._canvas.render_state()
         self._update_replay_kpis("magnetic", self._canvas.calibration())
+
+    def _rebuild_north_until(self, position_ms: float) -> None:
+        if self._recording is None or not isinstance(self._canvas, NorthCanvas):
+            return
+        self._canvas.reset_variation()
+        self._last_sample_t = -1
+        for sample in self._recording.samples:
+            t_ms = float(sample.get("t_ms", 0))
+            if t_ms > position_ms:
+                break
+            q = self._sample_quaternion(sample)
+            mag = sample.get("raw", {}).get("mag", [0, 0, 0])
+            cal = sample.get("visual", {}).get("magnetic_calibration")
+            center_lsb = cal.get("center_lsb") if isinstance(cal, dict) else None
+            drawing_angle, _calibrated = MeasurePage._compute_north_drawing_angle_rad(
+                float(mag[0]), float(mag[1]), float(mag[2]), tuple(q), center_lsb=center_lsb
+            )
+            now_s = t_ms / 1000.0
+            self._canvas.update_heading(drawing_angle, now_s=now_s)
+            self._last_sample_t = int(t_ms)
+        self._update_replay_kpis("north", drawing_angle)
 
     def _sample_at(self, position_ms: float) -> dict[str, Any] | None:
         if self._recording is None or not self._recording.samples:
@@ -901,6 +1198,21 @@ class ReplayPage(QWidget):
         self._recording.header.samples_count = len(self._recording.samples)
         self._recording.header.duration_ms = int(self._recording.samples[-1].get("t_ms", 0))
 
+    def _apply_recorded_calibration_to_canvas(self) -> None:
+        if self._recording is None or not self._recording.samples or self._canvas is None:
+            return
+        if isinstance(self._canvas, MagneticCanvas) and self._recording.header.mode == "magnetic":
+            for sample in reversed(self._recording.samples):
+                cal = sample.get("visual", {}).get("magnetic_calibration")
+                if isinstance(cal, dict) and cal.get("radius_lsb", 0.0) > 0.0:
+                    self._canvas.set_calibration(
+                        cal.get("center_lsb", [0.0, 0.0, 0.0]),
+                        cal.get("radius_lsb", 0.0),
+                        stable=cal.get("stable", False),
+                        draw=False,
+                    )
+                    break
+
     def _update_replay_kpis(self, mode: str, data: object | None) -> None:
         if mode == "orientation":
             if not isinstance(data, list):
@@ -912,6 +1224,12 @@ class ReplayPage(QWidget):
                     (f"Pitch {pitch:+.1f}°", "neutral"),
                     (f"Yaw {yaw:+.1f}°", "neutral"),
                 )
+        elif mode == "north":
+            if isinstance(data, float):
+                yaw_deg = math.degrees(data)
+                values = ((f"Norte {yaw_deg:+.1f}°", "neutral"),)
+            else:
+                values = (("Norte -", "neutral"),)
         elif mode == "magnetic" and isinstance(data, dict):
             center = data.get("center_lsb", [0.0, 0.0, 0.0])
             radius = float(data.get("radius_lsb", 0.0))
@@ -1074,6 +1392,19 @@ def _stylesheet() -> str:
     QFrame#plotHost QWidget {
         background: transparent;
     }
+    QFrame#plotHost QLabel#kpi {
+        background: #1F4F7A;
+        border: none;
+        border-radius: 10px;
+    }
+    QFrame#plotHost QLabel#kpi[state="stable"] {
+        background: #2E7D32;
+        border: none;
+    }
+    QFrame#plotHost QLabel#kpi[state="unstable"] {
+        background: #8E2424;
+        border: none;
+    }
     QFrame#kpiPanel {
         background: transparent;
         border: none;
@@ -1107,6 +1438,11 @@ def _stylesheet() -> str:
         color: #FFFFFF;
         border: 1px solid #CF2E2E;
     }
+    QPushButton[class="success"] {
+        background: #2E7D32;
+        color: #FFFFFF;
+        border: 1px solid #2E7D32;
+    }
     QFrame#plotHost QPushButton[class="ghost"] {
         background: #FFFFFF;
         color: #2A2D34;
@@ -1121,6 +1457,11 @@ def _stylesheet() -> str:
         background: #CF2E2E;
         color: #FFFFFF;
         border: 1px solid #CF2E2E;
+    }
+    QFrame#plotHost QPushButton[class="success"] {
+        background: #2E7D32;
+        color: #FFFFFF;
+        border: 1px solid #2E7D32;
     }
     QPushButton:disabled {
         background: #E5E7EB;

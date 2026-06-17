@@ -17,6 +17,9 @@
     "format": "json",
     "max_samples": 100000
   },
+  "metadata": {
+    "directory": "./metadata"
+  },
   "ui": {
     "background_color": "#F6FBFF",
     "accent_color": "#1D85ED",
