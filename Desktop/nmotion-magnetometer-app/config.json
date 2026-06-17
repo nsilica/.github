@@ -1,0 +1,29 @@
+{
+  "app": {
+    "title": "nMotion Magnetometer",
+    "window_width": 1280,
+    "window_height": 800,
+    "theme_mode": "light"
+  },
+  "serial": {
+    "port": null,
+    "baudrate": 115200,
+    "auto_connect": true,
+    "vid": "0x2FE3",
+    "pid": "0x4E4D"
+  },
+  "recording": {
+    "directory": "./recordings",
+    "format": "json",
+    "max_samples": 100000
+  },
+  "ui": {
+    "background_color": "#F6FBFF",
+    "accent_color": "#1D85ED",
+    "danger_color": "#CF2E2E",
+    "success_color": "#2E7D32",
+    "surface_dark": "#2A2D34",
+    "text_dark": "#404040",
+    "text_light": "#FFFFFF"
+  }
+}
